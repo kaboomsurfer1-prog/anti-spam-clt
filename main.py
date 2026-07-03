@@ -11,10 +11,17 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 
-# Ruolo che NON può taggare ruoli / here / everyone
-BLOCK_MENTION_ROLE_ID = 1505912122926694550
+# Ruolo normale che NON può taggare ruoli / here / everyone
+BLOCKED_NORMAL_ROLE_ID = 1505912122926694550
 
-# Parole volgari bloccate
+# Ruoli autorizzati a usare @everyone / @here / tag ruoli
+ALLOWED_TAG_ROLE_IDS = {
+    1505906085901504522,
+    1519377368354132110,
+    1505905849774641243,
+    1516817227901567168,
+}
+
 BAD_WORDS = [
     "pula",
     "muie",
@@ -65,17 +72,25 @@ def contains_bad_word(text: str) -> bool:
         w_normal = normalize_text(word)
         w_compact = compact_text(word)
 
-        if w_normal in normal:
+        if w_normal and w_normal in normal:
             return True
 
-        if w_compact in compact:
+        if w_compact and w_compact in compact:
             return True
 
     return False
 
 
-def has_blocked_role(member: discord.Member) -> bool:
-    return any(role.id == BLOCK_MENTION_ROLE_ID for role in member.roles)
+def has_role(member: discord.Member, role_id: int) -> bool:
+    return any(role.id == role_id for role in member.roles)
+
+
+def can_use_tags(member: discord.Member) -> bool:
+    # Se vuoi che anche Administrator possa usarli sempre, lascia questa parte.
+    if member.guild_permissions.administrator:
+        return True
+
+    return any(role.id in ALLOWED_TAG_ROLE_IDS for role in member.roles)
 
 
 async def send_log(guild: discord.Guild, title: str, description: str):
@@ -93,7 +108,10 @@ async def send_log(guild: discord.Guild, title: str, description: str):
         timestamp=discord.utils.utcnow()
     )
 
-    await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    try:
+        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except discord.Forbidden:
+        pass
 
 
 async def delete_and_warn(message: discord.Message, reason: str):
@@ -148,25 +166,35 @@ async def on_message(message: discord.Message):
 
     member = message.author
     content = message.content or ""
+    lower_content = content.lower()
 
-    # 1. Chi ha il ruolo 1505912122926694550 NON può taggare ruoli / here / everyone
-    if has_blocked_role(member):
-        has_everyone_or_here = (
-            message.mention_everyone
-            or "@everyone" in content.lower()
-            or "@here" in content.lower()
+    has_everyone_or_here = (
+        message.mention_everyone
+        or "@everyone" in lower_content
+        or "@here" in lower_content
+    )
+
+    has_role_mentions = len(message.role_mentions) > 0
+
+    authorized = can_use_tags(member)
+
+    # 1. Blocca @everyone / @here per tutti, tranne ruoli autorizzati
+    if has_everyone_or_here and not authorized:
+        await delete_and_warn(
+            message,
+            "Nu ai voie să folosești @everyone sau @here."
         )
+        return
 
-        has_role_mentions = len(message.role_mentions) > 0
+    # 2. Il ruolo normale 1505912122926694550 non può taggare ruoli
+    if has_role(member, BLOCKED_NORMAL_ROLE_ID) and has_role_mentions and not authorized:
+        await delete_and_warn(
+            message,
+            "Nu ai voie să dai tag la roluri."
+        )
+        return
 
-        if has_everyone_or_here or has_role_mentions:
-            await delete_and_warn(
-                message,
-                "Nu ai voie să dai tag la roluri, @here sau @everyone."
-            )
-            return
-
-    # 2. Blocca parole volgari
+    # 3. Blocca parole volgari
     if contains_bad_word(content):
         await delete_and_warn(
             message,
