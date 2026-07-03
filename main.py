@@ -1,5 +1,6 @@
 import os
 import re
+import asyncio
 import unicodedata
 
 import discord
@@ -11,10 +12,10 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 
-# Ruolo normale che NON può taggare ruoli / here / everyone
+# Ruolo normale / member
 BLOCKED_NORMAL_ROLE_ID = 1505912122926694550
 
-# Ruoli autorizzati a usare @everyone / @here / tag ruoli
+# SOLO questi ruoli possono usare @everyone / @here / tag ruoli
 ALLOWED_TAG_ROLE_IDS = {
     1505906085901504522,
     1519377368354132110,
@@ -81,16 +82,12 @@ def contains_bad_word(text: str) -> bool:
     return False
 
 
-def has_role(member: discord.Member, role_id: int) -> bool:
-    return any(role.id == role_id for role in member.roles)
-
-
-def can_use_tags(member: discord.Member) -> bool:
-    # Se vuoi che anche Administrator possa usarli sempre, lascia questa parte.
-    if member.guild_permissions.administrator:
-        return True
-
+def member_has_allowed_tag_role(member: discord.Member) -> bool:
     return any(role.id in ALLOWED_TAG_ROLE_IDS for role in member.roles)
+
+
+def member_has_blocked_role(member: discord.Member) -> bool:
+    return any(role.id == BLOCKED_NORMAL_ROLE_ID for role in member.roles)
 
 
 async def send_log(guild: discord.Guild, title: str, description: str):
@@ -148,6 +145,152 @@ async def delete_and_warn(message: discord.Message, reason: str):
     )
 
 
+async def set_mention_permission(channel: discord.abc.GuildChannel, role: discord.Role, value: bool):
+    overwrite = channel.overwrites_for(role)
+    overwrite.mention_everyone = value
+
+    await channel.set_permissions(
+        role,
+        overwrite=overwrite,
+        reason="Setup automat permisiuni @everyone / @here / tag roluri"
+    )
+
+
+async def apply_permissions_to_channel(channel: discord.abc.GuildChannel):
+    guild = channel.guild
+
+    # 1. @everyone NON può usare @everyone / @here / tag ruoli
+    await set_mention_permission(channel, guild.default_role, False)
+
+    # 2. Il ruolo normale NON può usare @everyone / @here / tag ruoli
+    blocked_role = guild.get_role(BLOCKED_NORMAL_ROLE_ID)
+    if blocked_role:
+        await set_mention_permission(channel, blocked_role, False)
+
+    # 3. Tutti i ruoli NON autorizzati vengono bloccati
+    for role in guild.roles:
+        if role.is_default():
+            continue
+
+        if role.id in ALLOWED_TAG_ROLE_IDS:
+            continue
+
+        if role.managed:
+            continue
+
+        try:
+            await set_mention_permission(channel, role, False)
+            await asyncio.sleep(0.15)
+        except discord.Forbidden:
+            pass
+        except Exception:
+            pass
+
+    # 4. Solo i ruoli autorizzati possono usare @everyone / @here / tag ruoli
+    for role_id in ALLOWED_TAG_ROLE_IDS:
+        role = guild.get_role(role_id)
+        if role:
+            await set_mention_permission(channel, role, True)
+            await asyncio.sleep(0.15)
+
+
+async def disable_public_role_mentions(guild: discord.Guild):
+    """
+    Mette i ruoli come non mentionable.
+    Così i membri normali non possono pingare ruoli anche se il ruolo era impostato come mentionable.
+    """
+    me = guild.me
+    if not me:
+        return 0, 0
+
+    changed = 0
+    skipped = 0
+
+    for role in guild.roles:
+        if role.is_default():
+            continue
+
+        if role.managed:
+            continue
+
+        # Il bot non può modificare ruoli sopra o uguali al suo ruolo
+        if role >= me.top_role:
+            skipped += 1
+            continue
+
+        if role.mentionable:
+            try:
+                await role.edit(
+                    mentionable=False,
+                    reason="Setup automat: blocco tag ruoli pentru membri normali"
+                )
+                changed += 1
+                await asyncio.sleep(0.2)
+            except discord.Forbidden:
+                skipped += 1
+            except Exception:
+                skipped += 1
+
+    return changed, skipped
+
+
+@bot.command(name="setup_mentions", aliases=["fixmentions", "setup_tag"])
+@commands.has_guild_permissions(administrator=True)
+async def setup_mentions(ctx: commands.Context):
+    await ctx.reply(
+        "⏳ Aplic permisiunile pe toate canalele. Așteaptă puțin...",
+        mention_author=False,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+    guild = ctx.guild
+    success = 0
+    failed = 0
+
+    # Prima cosa: disattiva mentionable sui ruoli
+    changed_roles, skipped_roles = await disable_public_role_mentions(guild)
+
+    # Poi applica i permessi su tutti i canali / categorie
+    for channel in guild.channels:
+        try:
+            await apply_permissions_to_channel(channel)
+            success += 1
+            await asyncio.sleep(0.3)
+        except discord.Forbidden:
+            failed += 1
+        except Exception:
+            failed += 1
+
+    await ctx.send(
+        f"✅ Gata.\n\n"
+        f"Canale configurate: **{success}**\n"
+        f"Canale cu eroare: **{failed}**\n"
+        f"Roluri făcute non-mentionable: **{changed_roles}**\n"
+        f"Roluri sărite: **{skipped_roles}**\n\n"
+        f"Acum doar rolurile autorizate pot folosi `@everyone`, `@here` și tag la roluri.",
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+@setup_mentions.error
+async def setup_mentions_error(ctx: commands.Context, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.reply(
+            "❌ Nu ai permisiunea necesară. Doar Administrator poate folosi această comandă.",
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+
+
+@bot.event
+async def on_guild_channel_create(channel):
+    # Applica automaticamente i permessi anche ai canali nuovi
+    try:
+        await apply_permissions_to_channel(channel)
+    except Exception:
+        pass
+
+
 @bot.event
 async def on_ready():
     print(f"Bot protecție online ca {bot.user} | Servere: {len(bot.guilds)}")
@@ -175,26 +318,23 @@ async def on_message(message: discord.Message):
     )
 
     has_role_mentions = len(message.role_mentions) > 0
+    allowed = member_has_allowed_tag_role(member)
 
-    authorized = can_use_tags(member)
-
-    # 1. Blocca @everyone / @here per tutti, tranne ruoli autorizzati
-    if has_everyone_or_here and not authorized:
+    # Sicurezza extra: cancella comunque se qualcuno riesce a scrivere il tag
+    if has_everyone_or_here and not allowed:
         await delete_and_warn(
             message,
             "Nu ai voie să folosești @everyone sau @here."
         )
         return
 
-    # 2. Il ruolo normale 1505912122926694550 non può taggare ruoli
-    if has_role(member, BLOCKED_NORMAL_ROLE_ID) and has_role_mentions and not authorized:
+    if has_role_mentions and not allowed:
         await delete_and_warn(
             message,
             "Nu ai voie să dai tag la roluri."
         )
         return
 
-    # 3. Blocca parole volgari
     if contains_bad_word(content):
         await delete_and_warn(
             message,
